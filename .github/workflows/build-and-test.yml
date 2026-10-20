@@ -1,0 +1,94 @@
+name: build-and-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level Go test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # x/net is tested on the two supported Go releases; tests tagged
+        # `go1.25 || goexperiment.synctest` (e.g. http2 transport tests) only build on 1.25.
+        go: ["1.24.x", "1.25.x"]
+    env:
+      GOTOOLCHAIN: local
+      MODULE_PATH: golang.org/x/net
+      MODULE_VERSION: v0.45.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - name: Go version
+        run: go version
+      - name: Create module zip
+        if: matrix.go == '1.25.x'
+        run: |
+          set -euo pipefail
+          # Pack from a copy of the tree without this CI workflow (upstream ships no .github).
+          rm -rf "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/zipper"
+          mkdir -p "$RUNNER_TEMP/modsrc" "$RUNNER_TEMP/zipper" build_output
+          rsync -a --delete --exclude .git ./ "$RUNNER_TEMP/modsrc/"
+          rm -rf "$RUNNER_TEMP/modsrc/.github" "$RUNNER_TEMP/modsrc/build_output"
+          cd "$RUNNER_TEMP/zipper"
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              if len(os.Args) != 5 {
+                  log.Fatal("usage: zipper <module-path> <version> <source-dir> <output-zip>")
+              }
+              m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                  log.Fatal(err)
+              }
+              log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          go mod init zipper
+          go get golang.org/x/mod@v0.28.0
+          go run . "$MODULE_PATH" "$MODULE_VERSION" "$RUNNER_TEMP/modsrc" "$GITHUB_WORKSPACE/build_output/$MODULE_VERSION.zip"
+          unzip -l "$GITHUB_WORKSPACE/build_output/$MODULE_VERSION.zip" | tail -1
+      - name: Build
+        run: go build ./...
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }; done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+          fi
+          LOG="$RUNNER_TEMP/full.log"; [ -n "$TEST_FILTER" ] && LOG="$RUNNER_TEMP/scoped.log"
+          awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} /^--- PASS/{tp++} END{printf "TEST SUMMARY: %d passed, %d failed, %d skipped (top-level: %d passed)\n", p, f, s, tp}' "$LOG"
+      - uses: actions/upload-artifact@v4
+        if: matrix.go == '1.25.x'
+        with:
+          name: go-module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
